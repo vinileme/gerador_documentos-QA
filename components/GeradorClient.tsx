@@ -26,6 +26,8 @@ const SECTION_LABELS: Record<keyof ReportStructured, string> = {
   checklist: "Checklist final para QA",
 };
 
+type TransportMode = "idle" | "connecting" | "realtime" | "polling";
+
 type WsIncoming =
   | { type: "progress"; jobId: string; stage: string; message?: string; percent?: number }
   | { type: "done"; jobId: string; payload: ReportPayload }
@@ -43,6 +45,23 @@ function wsBaseUrl(): string {
   return "ws://localhost:3001";
 }
 
+function clampPercent(n: number): number {
+  return Math.min(100, Math.max(0, n));
+}
+
+function progressLabelFromStage(stage: string): string {
+  const map: Record<string, string> = {
+    queued: "Na fila…",
+    resolve_url: "Validando URL…",
+    fetch_workitem: "Obtendo work item…",
+    fetch_attachments: "Buscando anexos…",
+    template_rules: "Aplicando regras…",
+    llm: "Gerando conteúdo…",
+    finalize: "Finalizando…",
+  };
+  return map[stage] ?? stage.replace(/_/g, " ");
+}
+
 export function GeradorClient() {
   const [workItemUrl, setWorkItemUrl] = useState("");
   const [pat, setPat] = useState("");
@@ -53,8 +72,18 @@ export function GeradorClient() {
   const [payload, setPayload] = useState<ReportPayload | null>(null);
   const [pageIndex, setPageIndex] = useState(0);
 
+  const [transportMode, setTransportMode] = useState<TransportMode>("idle");
+  const [progressPercent, setProgressPercent] = useState<number | null>(null);
+  const [progressLabel, setProgressLabel] = useState("");
+
   const wsRef = useRef<WebSocket | null>(null);
   const pollRef = useRef<number | null>(null);
+  const wsOpenedRef = useRef(false);
+  const busyRef = useRef(false);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
 
   const pageKey = SECTION_KEYS[pageIndex]!;
   const pageLabel = SECTION_LABELS[pageKey];
@@ -74,6 +103,9 @@ export function GeradorClient() {
       setBusy(false);
       setPageIndex(0);
       stopPolling();
+      setTransportMode("idle");
+      setProgressPercent(null);
+      setProgressLabel("");
       pushLog("Concluído: relatório pronto para preview e download.");
     },
     [pushLog, stopPolling],
@@ -95,6 +127,9 @@ export function GeradorClient() {
       if (data.status === "error") {
         setBusy(false);
         stopPolling();
+        setTransportMode("idle");
+        setProgressPercent(null);
+        setProgressLabel("");
         setError(data.message);
       }
     },
@@ -103,11 +138,14 @@ export function GeradorClient() {
 
   useEffect(() => {
     if (!jobId) return;
+    wsOpenedRef.current = false;
     const url = `${wsBaseUrl()}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.addEventListener("open", () => {
+      wsOpenedRef.current = true;
+      setTransportMode("realtime");
       ws.send(JSON.stringify({ type: "subscribe", jobId }));
       pushLog(`WebSocket conectado (${url}).`);
     });
@@ -123,6 +161,12 @@ export function GeradorClient() {
 
       if (msg.type === "progress") {
         pushLog(`[${msg.stage}] ${msg.message ?? ""}`.trim());
+        if (typeof msg.percent === "number") {
+          setProgressPercent(clampPercent(msg.percent));
+        }
+        const label =
+          (msg.message && msg.message.trim()) || progressLabelFromStage(msg.stage);
+        setProgressLabel(label);
         return;
       }
       if (msg.type === "done") {
@@ -134,6 +178,9 @@ export function GeradorClient() {
         setError(msg.message);
         setBusy(false);
         stopPolling();
+        setTransportMode("idle");
+        setProgressPercent(null);
+        setProgressLabel("");
         ws.close();
         return;
       }
@@ -143,11 +190,15 @@ export function GeradorClient() {
     });
 
     ws.addEventListener("error", () => {
+      setTransportMode("polling");
       pushLog("WebSocket indisponível; usando polling em /api/jobs/:id.");
     });
 
     ws.addEventListener("close", () => {
       wsRef.current = null;
+      if (!wsOpenedRef.current && busyRef.current) {
+        setTransportMode("polling");
+      }
     });
 
     return () => {
@@ -176,6 +227,9 @@ export function GeradorClient() {
     setError(null);
     setPayload(null);
     setLog([]);
+    setTransportMode("idle");
+    setProgressPercent(null);
+    setProgressLabel("");
     setBusy(true);
     setJobId(null);
 
@@ -188,11 +242,13 @@ export function GeradorClient() {
     if (!res.ok) {
       const t = await res.text();
       setBusy(false);
+      setTransportMode("idle");
       setError(t || "Falha ao iniciar o job.");
       return;
     }
 
     const data = (await res.json()) as { jobId: string };
+    setTransportMode("connecting");
     setJobId(data.jobId);
   };
 
@@ -214,6 +270,24 @@ export function GeradorClient() {
     if (!payload) return "";
     return payload.structured[pageKey] ?? "";
   }, [payload, pageKey]);
+
+  const transportStatusLine = useMemo(() => {
+    if (busy) {
+      if (transportMode === "connecting") return "Conectando ao tempo real…";
+      if (transportMode === "realtime") return "Atualizações em tempo real.";
+      if (transportMode === "polling") return "Modo alternativo: verificação periódica.";
+    }
+    if (transportMode === "idle" && !busy) return "Pronto para gerar.";
+    return "—";
+  }, [busy, transportMode]);
+
+  const showDeterminateBar =
+    busy && transportMode === "realtime" && typeof progressPercent === "number";
+  const showIndeterminateBar =
+    busy &&
+    (transportMode === "polling" ||
+      (transportMode === "realtime" && progressPercent === null) ||
+      transportMode === "connecting");
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-4 py-10">
@@ -283,35 +357,96 @@ export function GeradorClient() {
         ) : null}
       </section>
 
+      <section className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Progresso</h2>
+        <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{transportStatusLine}</p>
+
+        {busy ? (
+          <>
+            {progressLabel ? (
+              <p className="mt-2 text-sm text-zinc-800 dark:text-zinc-200">{progressLabel}</p>
+            ) : transportMode === "polling" ? (
+              <p className="mt-2 text-sm text-zinc-800 dark:text-zinc-200">
+                Processando em segundo plano (sem etapas detalhadas neste modo).
+              </p>
+            ) : null}
+
+            <div
+              className="mt-3 h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={showDeterminateBar ? progressPercent! : undefined}
+              aria-busy={true}
+              aria-label="Progresso da geração"
+            >
+              {showDeterminateBar ? (
+                <div
+                  className="h-full rounded-full bg-zinc-700 transition-[width] duration-300 ease-out dark:bg-zinc-300"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              ) : showIndeterminateBar ? (
+                <div className="h-full w-2/5 rounded-full bg-zinc-600 gerador-progress-indeterminate dark:bg-zinc-400" />
+              ) : null}
+            </div>
+          </>
+        ) : null}
+
+        <details className="mt-4">
+          <summary className="cursor-pointer text-xs font-medium text-zinc-600 underline-offset-2 hover:underline dark:text-zinc-400">
+            Detalhes técnicos (log)
+          </summary>
+          <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-lg bg-zinc-50 p-3 text-xs text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+            {log.length ? log.join("\n") : busy ? "Aguardando eventos…" : "—"}
+          </pre>
+        </details>
+      </section>
+
       {payload ? (
         <section className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div>
               <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">Preview</h2>
               <p className="text-xs text-zinc-600 dark:text-zinc-300">
                 WI #{payload.meta.workItemId} · {payload.meta.workItemType} · {payload.meta.title}
               </p>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm disabled:opacity-40 dark:border-zinc-700"
-                disabled={pageIndex === 0}
-                onClick={() => setPageIndex((i) => Math.max(0, i - 1))}
-              >
-                Anterior
-              </button>
-              <span className="text-sm text-zinc-700 dark:text-zinc-200">
-                {pageIndex + 1}/{SECTION_KEYS.length}
-              </span>
-              <button
-                type="button"
-                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-sm disabled:opacity-40 dark:border-zinc-700"
-                disabled={pageIndex >= SECTION_KEYS.length - 1}
-                onClick={() => setPageIndex((i) => Math.min(SECTION_KEYS.length - 1, i + 1))}
-              >
-                Próximo
-              </button>
+            <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+              <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs sm:max-w-md">
+                <span className="font-medium text-zinc-700 dark:text-zinc-300">Seção</span>
+                <select
+                  className="rounded-lg border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900 outline-none ring-zinc-400 focus:ring-2 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-50"
+                  value={pageIndex}
+                  onChange={(e) => setPageIndex(Number(e.target.value))}
+                >
+                  {SECTION_KEYS.map((key, i) => (
+                    <option key={key} value={i}>
+                      {SECTION_LABELS[key]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium disabled:opacity-40 dark:border-zinc-700"
+                  disabled={pageIndex === 0}
+                  onClick={() => setPageIndex((i) => Math.max(0, i - 1))}
+                >
+                  Anterior
+                </button>
+                <span className="text-xs tabular-nums text-zinc-600 dark:text-zinc-300">
+                  {pageIndex + 1}/{SECTION_KEYS.length}
+                </span>
+                <button
+                  type="button"
+                  className="rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium disabled:opacity-40 dark:border-zinc-700"
+                  disabled={pageIndex >= SECTION_KEYS.length - 1}
+                  onClick={() => setPageIndex((i) => Math.min(SECTION_KEYS.length - 1, i + 1))}
+                >
+                  Próximo
+                </button>
+              </div>
             </div>
           </div>
 
@@ -332,13 +467,6 @@ export function GeradorClient() {
           ) : null}
         </section>
       ) : null}
-
-      <section className="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-950">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Progresso</h2>
-        <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap text-xs text-zinc-700 dark:text-zinc-200">
-          {log.length ? log.join("\n") : busy ? "Aguardando eventos…" : "—"}
-        </pre>
-      </section>
     </div>
   );
 }
