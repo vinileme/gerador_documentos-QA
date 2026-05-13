@@ -26,7 +26,8 @@ Reduzir ambiguidade entre negócio, desenvolvimento e QA ao:
 | **Anexos** | Extração de texto: **PDF**, **DOCX**, **XLSX**; outros formatos são listados como não suportados. |
 | **Geração** | Camada **determinística** (template PT-BR) + **LLM opcional** (API compatível com OpenAI). |
 | **Progresso** | Job assíncrono com eventos via **WebSocket**; **fallback por polling** em `GET /api/jobs/:jobId` se o WS não estiver disponível. |
-| **Entrega** | Preview **paginado por seção** na UI; botão **Baixar ZIP** com `relatorio.md` e `relatorio.json`. |
+| **Entrega** | Preview **por seção** na UI; botão **Baixar ZIP** com `relatorio.md` e `relatorio.json`. |
+| **Interface (UX)** | **Barra de progresso** (determinística com `percent` via WS; **indeterminada** em modo só-polling ou antes do primeiro evento); **linha de status** (tempo real vs verificação periódica); **log técnico** recolhível (`<details>`); **seletor de seção** + botões Anterior/Próximo; tipografia **Geist** no corpo da página. |
 
 ---
 
@@ -169,8 +170,8 @@ npm start
 2. Cole a **URL** do work item (formato `_workitems/edit/{id}`).
 3. Informe o **PAT** (não é armazenado após o job; trafega só no `POST` para o servidor).
 4. Clique em **Gerar documentação**.
-5. Acompanhe o **progresso** (log na página + WebSocket quando disponível).
-6. Navegue no **preview** com **Anterior** / **Próximo** (uma seção por página).
+5. Acompanhe o **progresso** (barra + texto; WebSocket quando disponível, com **fallback** por polling). Abra **Detalhes técnicos (log)** se precisar do histórico de etapas.
+6. No **preview**, escolha a **seção** no menu ou use **Anterior** / **Próximo** (uma seção por vez).
 7. Baixe o **ZIP** com `relatorio.md` e `relatorio.json` antes de fechar a aba (o servidor **não** guarda o relatório para download posterior).
 
 ---
